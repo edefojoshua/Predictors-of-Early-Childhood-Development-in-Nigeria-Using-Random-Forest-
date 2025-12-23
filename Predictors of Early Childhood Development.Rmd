@@ -1,0 +1,313 @@
+---
+title: "Predictors of Early Childhood Development in Nigeria Using Random Forest Models"
+author: "Joshua W. Edefo"
+date: "`r Sys.Date()`"
+license: GPL-3.0
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+  github_document: default
+---
+#Introduction
+This study applies machine-learning methods to identify predictors
+#of early childhood development outcomes in Nigeria using nationally representative survey data.
+
+
+# ------------------------------------------------------------ 
+# License: GPL-3.0
+
+Copyright (C) 2025 Joshua W. Edefo
+
+This program is free code: you can redistribute it and/or modify it under the terms of the GNU General Public License either version 3 of the License or any later version.
+
+This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
+# ------------------------------------------------------------ 
+
+```{r a, message=FALSE}
+library(haven)        # read_dta()
+library(data.table)  # fast data manipulation, :=, .SD
+library(fst)          # write_fst(), read_fst()
+library(caret)        # train(), createDataPartition(), confusionMatrix()
+library(ranger)       # random forest engine
+library(ggplot2)      # plots
+library(pROC)         # ROC / AUC
+library(rcompanion)  # cramerV()
+library(DescTools)   # cramerV()
+library(usethis)    # project-setup package
+
+set.seed(123)
+
+# External data location
+data_path <- "C:/Users/edefoj/Documents/Per/MICS/Nigeria _2021"
+dta_file  <- file.path(data_path, "children_pro.dta")
+fst_file  <- file.path(data_path, "children_pro.fst")
+# Safety check
+if (!file.exists(dta_file)) {
+  stop("Stata file not found at: ", dta_file)
+}
+
+# Read the Stata file
+data <- read_dta(dta_file)
+setDT(data)
+
+# Inspect data
+head(data)
+class(data)
+
+# Select specified columns
+data <- data[, .(agegrp1_cat, HL4, agegrp, HH6, zone, windex5MICS, cdisability, melevel_comb, EC1, ethnicity,UCD2G, UCD2K, UCF18, CA1)]
+
+
+# Inspect structure
+str(data)
+nrow(data)
+names(data)
+head(data)
+class(data)
+
+# Modeling libraries
+library(caret)
+library(ranger)
+
+# Target distribution
+unique(data$agegrp1_cat)
+prop.table(table(data$agegrp1_cat))
+
+# Missing values
+any(is.na(data))
+
+############################################
+# Data cleaning for ML (BASE R — SAFE)
+############################################
+# Ordinal predictors
+ordinal_vars <- c("agegrp", "windex5MICS", "melevel_comb", "EC1")
+
+#Convert numeric predictors to factors (excluding target)
+for (v in ordinal_vars) {
+data[[v]] <- factor(data[[v]], ordered = TRUE)
+}
+
+num_vars <- names(data)[sapply(data, is.numeric)]
+num_vars <- setdiff(num_vars, "agegrp1_cat")
+
+for (v in num_vars) {
+data[[v]] <- factor(data[[v]])
+}
+
+#Target variable
+data$agegrp1_cat <- factor(data$agegrp1_cat)
+
+############################################
+# Class balancing
+############################################
+
+tbl <- table(data$agegrp1_cat)
+w <- 1 / tbl
+w <- w / min(w)
+
+############################################
+# Feature exploration
+############################################
+
+library(ggplot2)
+ggplot(data, aes(x = ethnicity)) + geom_bar()
+ggplot(data, aes(x = agegrp)) + geom_bar()
+
+############################################
+# Association checks
+############################################
+
+library(rcompanion)
+
+cat_cols <- names(Filter(is.factor, data))
+
+cramer_matrix <- matrix(
+  NA, length(cat_cols), length(cat_cols),
+  dimnames = list(cat_cols, cat_cols)
+)
+
+for (i in cat_cols) {
+  for (j in cat_cols) {
+    cramer_matrix[i, j] <- cramerV(
+      table(data[[i]], data[[j]]),
+      bias.correct = TRUE
+    )
+  }
+}
+
+############################################
+# Leakage check
+############################################
+
+target_var <- "agegrp1_cat"
+predictors_list <- setdiff(names(data), target_var)
+
+library(DescTools)
+cramerV_target <- sapply(
+  data[, ..predictors_list],
+  function(x) cramerV(x, data[[target_var]])
+)
+
+sort(cramerV_target, decreasing = TRUE)
+
+############################################
+# Train/test split
+############################################
+
+set.seed(123)
+
+test_index <- createDataPartition(data$agegrp1_cat, p = 0.2, list = FALSE)
+test_data  <- data[test_index]
+train_data <- data[-test_index]
+
+train_weights <- w[train_data$agegrp1_cat]
+
+############################################
+# Fix factor levels
+############################################
+
+train_data$agegrp1_cat <- factor(
+  train_data$agegrp1_cat,
+  levels = c("0", "1"),
+  labels = c("class0", "class1")
+)
+
+test_data$agegrp1_cat <- factor(
+  test_data$agegrp1_cat,
+  levels = c("0", "1"),
+  labels = c("class0", "class1")
+)
+
+############################################
+# Cross-validation
+############################################
+
+tc <- trainControl(
+  method = "cv",
+  number = 10,
+  savePredictions = "final",
+  classProbs = TRUE,
+  allowParallel = TRUE
+)
+
+############################################
+# Default ranger model
+############################################
+
+default_model <- train(
+  agegrp1_cat ~ .,
+  data = train_data,
+  method = "ranger",
+  trControl = tc,
+  tuneGrid = data.frame(
+    mtry = floor(sqrt(ncol(train_data) - 1)),
+    splitrule = "gini",
+    min.node.size = 1
+  ),
+  weights = train_weights,
+  importance = "impurity"
+)
+
+############################################
+# Tuned ranger model
+############################################
+
+tuned_grid <- expand.grid(
+  mtry = c(3, 5, 7),
+  splitrule = c("gini", "extratrees"),
+  min.node.size = c(1, 5, 10)
+)
+
+tuned_model <- train(
+  agegrp1_cat ~ .,
+  data = train_data,
+  method = "ranger",
+  trControl = tc,
+  tuneGrid = tuned_grid,
+  weights = train_weights,
+  importance = "impurity"
+)
+
+############################################
+# Model selection
+############################################
+
+best_model <- if (max(tuned_model$results$Accuracy) >
+                  max(default_model$results$Accuracy)) {
+  tuned_model
+} else {
+  default_model
+}
+
+############################################
+# Test performance
+############################################
+
+test_pred <- predict(best_model, test_data)
+mean(test_pred == test_data$agegrp1_cat)
+
+confusionMatrix(
+  test_pred,
+  test_data$agegrp1_cat,
+  positive = "class1"
+)
+
+```
+
+ Model perfoemance Evaluatioons and plots
+
+```{r c}
+
+############################################
+# ROC / AUC
+############################################
+
+library(pROC)
+test_prob <- predict(best_model, test_data, type = "prob")[, "class1"]
+roc_obj <- roc(test_data$agegrp1_cat, test_prob)
+auc(roc_obj)
+plot(roc_obj)
+
+############################################
+# Feature importance
+############################################
+# Feature importance
+imp <- best_model$finalModel$variable.importance
+
+imp_df <- data.frame(
+  Feature = names(imp),
+  Importance = imp
+)
+
+imp_df <- imp_df[order(imp_df$Importance, decreasing = TRUE), ]
+
+imp_df2 <- aggregate(
+  Importance ~ gsub("\\..*|\\^.*", "", Feature),
+  imp_df,
+  sum
+)
+
+names(imp_df2)[1] <- "Feature"
+
+library(ggplot2)
+
+ggplot(imp_df2, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Variable Importance (Aggregated)",
+    x = "Predictor",
+    y = "Importance"
+  )
+
+```
+## Session information
+
+```{r session-info, message=FALSE, warning=FALSE}
+
+sessionInfo()
+```
